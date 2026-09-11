@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "name": "FoodOrderingAppApplication (Run)",
+      "request": "launch",
+      "mainClass": "com.foodapp.foodorderingapp.FoodOrderingAppApplication",
+      "projectName": "food-ordering-app",
+      "cwd": "${workspaceFolder}/food-ordering-app-main"
+    }
+  ]
+}

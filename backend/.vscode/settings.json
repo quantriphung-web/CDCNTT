@@ -1,0 +1,6 @@
+{
+  "java.jdt.ls.lombokSupport.enabled": true,
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "spring-boot.ls.check-jvm": true,
+  "java.jdt.ls.java.home": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.20.101-hotspot"
+}
