@@ -1,0 +1,4 @@
+ultralytics>=8.3
+opencv-python>=4.8
+numpy
+lap
