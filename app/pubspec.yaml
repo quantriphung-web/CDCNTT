@@ -1,0 +1,26 @@
+name: baby_security_app
+description: Flutter Mobile App for Real-time Baby Monitor and Anti-Theft AI Security System.
+version: 1.0.0+1
+publish_to: "none"
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  web_socket_channel: ^3.0.1
+  intl: ^0.19.0
+  flutter_local_notifications: ^17.2.4
+  permission_handler: ^11.3.1
+  camera: ^0.11.0+2
+  image: ^4.1.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
