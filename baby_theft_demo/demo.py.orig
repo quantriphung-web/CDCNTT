@@ -1,0 +1,456 @@
+"""
+Demo: Trông trẻ + Chống trộm bằng YOLOv8 (model pretrained, không cần train).
+Chống trộm = tự nhận diện NGƯỜI LẠ ở bất kỳ đâu trong khung hình (không cần vẽ vùng cấm):
+mặt người nhà đã đăng ký trong thư mục family/ -> bình thường; mặt lạ -> báo động.
+
+Chạy trên video:   python demo.py --source video.mp4
+Chạy bằng webcam:  python demo.py --source 0
+
+Phím tắt trong cửa sổ:
+  M      : đổi chế độ  BOTH -> BABY (trông trẻ) -> THEFT (chống trộm)
+  R      : vẽ lại vùng giường / vùng cấm
+  SPACE  : tạm dừng / tiếp tục
+  S      : chụp ảnh màn hình
+  Q/ESC  : thoát
+"""
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+from family_faces import FaceID, ascii_name
+
+# ----------------------------- Cấu hình demo -----------------------------
+SLEEP_SEC = 4.0         # đứng yên bao lâu (giây VIDEO) thì coi là đang ngủ  (thực tế nên 150)
+MOVE_THRESHOLD = 6.0    # px/giây (đã chuẩn hóa theo chiều cao khung) - dưới ngưỡng = đứng yên
+SAFE_MARGIN = 0.15      # vùng an toàn = thu nhỏ giường vào trong 15%
+RISK_FRAMES = 8         # số frame liên tiếp ngoài vùng an toàn thì báo nguy cơ rơi
+ALERT_COOLDOWN = 5.0    # giây VIDEO giữa 2 cảnh báo cùng loại
+FACE_EVERY = 5          # cứ mỗi N frame thì nhận diện mặt 1 lần cho mỗi người
+FAMILY_CONFIRM = 2      # cần ít nhất N lần khớp mặt người nhà để xác nhận là người nhà
+STRANGER_CONFIRM = 3    # cần ít nhất N lần thấy mặt rõ mà KHÔNG khớp ai thì kết luận là người lạ
+UNVERIFIED_SEC = 8.0    # người xuất hiện quá N giây mà chưa thấy mặt (quay lưng, che mặt...) -> cảnh báo "chưa xác minh"
+
+GREEN = (80, 200, 80)
+BLUE = (255, 150, 50)
+RED = (60, 60, 230)
+YELLOW = (0, 215, 255)
+ORANGE = (0, 140, 255)
+WHITE = (255, 255, 255)
+MODES = ["BOTH", "BABY", "THEFT"]
+
+
+# ----------------------------- Tiện ích -----------------------------
+def beep():
+    """Phát tiếng bíp (Windows dùng winsound, hệ khác dùng ký tự chuông)."""
+    try:
+        import winsound
+        winsound.Beep(1000, 250)
+    except Exception:
+        print("\a", end="", flush=True)
+
+
+def put_text(img, text, org, color=WHITE, scale=0.6, thick=2, bg=True):
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    x, y = org
+    if bg:
+        cv2.rectangle(img, (x - 3, y - h - 4), (x + w + 3, y + base + 2), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def feet(box):
+    """Điểm chân (giữa cạnh dưới bbox) - hợp lý hơn tâm để xét người có đứng trong vùng cấm."""
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2.0, y2)
+
+
+def in_rect(pt, rect):
+    x, y = pt
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def shrink(rect, ratio):
+    x1, y1, x2, y2 = rect
+    dx, dy = (x2 - x1) * ratio, (y2 - y1) * ratio
+    return (x1 + dx, y1 + dy, x2 - dx, y2 - dy)
+
+
+def box_area(b):
+    return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+
+# ----------------------------- Vùng giường / vùng cấm -----------------------------
+def zones_path(source):
+    base = os.path.splitext(os.path.basename(str(source)))[0] if not str(source).isdigit() else "webcam"
+    return f"zones_{base}.json"
+
+
+def select_zones(frame, path):
+    """Cho người dùng kéo chuột chọn 2 vùng trên frame đầu tiên."""
+    zones = {"bed": None}
+    h, w = frame.shape[:2]
+
+    def pick(title):
+        win = "Chon vung"
+        msg = f"{title} - keo chuot, ENTER xac nhan, C = bo qua"
+        tmp = frame.copy()
+        put_text(tmp, msg, (10, 28), YELLOW, 0.65)
+        r = cv2.selectROI(win, tmp, showCrosshair=False, fromCenter=False)
+        cv2.destroyWindow(win)
+        x, y, rw, rh = r
+        if rw < 5 or rh < 5:
+            return None
+        return [int(x), int(y), int(x + rw), int(y + rh)]
+
+    zones["bed"] = pick("Chon GIUONG/NOI (vung tre nam)")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(zones, f)
+    return zones
+
+
+def load_or_select_zones(frame, path, force=False):
+    if not force and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return select_zones(frame, path)
+
+
+# ----------------------------- Logic chính -----------------------------
+class Monitor:
+    def __init__(self, fps, frame_h):
+        self.fps = fps
+        self.frame_h = frame_h
+        self.child_id = None
+        self.hist = deque(maxlen=int(max(fps, 10)))   # lịch sử vị trí tâm bé (~1 giây)
+        self.still_since = None
+        self.sleeping = False
+        self.risk_count = 0
+        self.persons = {}           # track id -> trạng thái nhận diện mặt
+        self.pending_snaps = []     # ảnh cần lưu sau khi vẽ xong khung hình
+        self.last_alert = {}
+        self.log = deque(maxlen=6)  # các sự kiện gần đây hiển thị trên màn hình
+
+    def can_alert(self, kind, t):
+        last = self.last_alert.get(kind)
+        if last is None or t - last >= ALERT_COOLDOWN:
+            self.last_alert[kind] = t
+            return True
+        return False
+
+    def event(self, t, text, snapshot_frame=None, kind="evt"):
+        stamp = f"{int(t // 60):02d}:{int(t % 60):02d}"
+        self.log.appendleft((stamp, text))
+        print(f"[{stamp}] {text}")
+        if snapshot_frame is not None:
+            self.pending_snaps.append(f"alerts/{kind}_{int(t * 1000):08d}.jpg")
+
+    def flush_snapshots(self, vis):
+        """Lưu ảnh cảnh báo (sau khi đã vẽ khung người + banner lên vis)."""
+        if self.pending_snaps:
+            os.makedirs("alerts", exist_ok=True)
+            for name in self.pending_snaps:
+                cv2.imwrite(name, vis)
+            self.pending_snaps = []
+
+    # --- chọn bé: người nằm trong vùng giường, khóa theo track id ---
+    def pick_child(self, people, bed):
+        if self.child_id is not None and any(p[0] == self.child_id for p in people):
+            return self.child_id
+        self.child_id = None
+        if bed is None:
+            return None
+        cands = [p for p in people if in_rect(center(p[1]), bed)]
+        if cands:
+            # bé = người có bbox nhỏ nhất trong giường
+            self.child_id = min(cands, key=lambda p: box_area(p[1]))[0]
+            self.hist.clear()
+            self.still_since = None
+            self.sleeping = False
+        return self.child_id
+
+    def update_baby(self, child, bed, t, frame):
+        """child = (id, box). Trả về (trạng thái, màu)."""
+        cx, cy = center(child[1])
+        self.hist.append((t, cx, cy))
+
+        # tốc độ di chuyển (px/giây, chuẩn hóa theo chiều cao khung 480)
+        speed = 0.0
+        if len(self.hist) >= 2:
+            t0, x0, y0 = self.hist[0]
+            dt = max(t - t0, 1e-3)
+            speed = math.hypot(cx - x0, cy - y0) / dt * (480.0 / self.frame_h)
+
+        status, color = "TRE DANG THUC", GREEN
+        if speed < MOVE_THRESHOLD:
+            if self.still_since is None:
+                self.still_since = t
+            if t - self.still_since >= SLEEP_SEC:
+                if not self.sleeping:
+                    self.sleeping = True
+                    self.event(t, "Tre da NGU", frame, "sleep")
+                status, color = "TRE DANG NGU (zZz)", BLUE
+        else:
+            self.still_since = None
+            if self.sleeping:
+                self.sleeping = False
+                if self.can_alert("wake", t):
+                    self.event(t, "CANH BAO: tre THUC DAY!", frame, "wake")
+                    beep()
+            status, color = "TRE DANG THUC", GREEN
+
+        # nguy cơ rơi: tâm bé ra ngoài vùng an toàn (giường thu nhỏ)
+        if bed is not None:
+            safe = shrink(bed, SAFE_MARGIN)
+            if not in_rect((cx, cy), safe):
+                self.risk_count += 1
+            else:
+                self.risk_count = 0
+            if self.risk_count >= RISK_FRAMES:
+                status, color = "NGUY CO ROI KHOI GIUONG!", RED
+                if self.can_alert("fall", t):
+                    self.event(t, "CANH BAO: tre gan mep / ra khoi giuong!", frame, "fall")
+                    beep()
+        return status, color
+
+    def update_people(self, people, frame, t, faceid):
+        """
+        Phân loại từng người (trừ bé): family / stranger / unverified / pending.
+        Trả về dict id -> (loại, tên_người_nhà_hoặc_None).
+        """
+        result = {}
+        seen = set()
+        for pid, box in people:
+            if pid == self.child_id:
+                continue
+            seen.add(pid)
+            st = self.persons.setdefault(pid, {"first": t, "fam": {}, "str": 0, "n": 0})
+            st["n"] += 1
+            if (st["n"] - 1) % FACE_EVERY == 0:
+                r = faceid.identify(frame, box)
+                if r is not None:
+                    name, _score = r
+                    if name is not None:
+                        st["fam"][name] = st["fam"].get(name, 0) + 1
+                    else:
+                        st["str"] += 1
+
+            fam_total = sum(st["fam"].values())
+            if fam_total >= FAMILY_CONFIRM and fam_total > st["str"]:
+                result[pid] = ("family", max(st["fam"], key=st["fam"].get))
+            elif st["str"] >= STRANGER_CONFIRM and st["str"] > fam_total:
+                result[pid] = ("stranger", None)
+            elif t - st["first"] >= UNVERIFIED_SEC:
+                result[pid] = ("unverified", None)
+            else:
+                result[pid] = ("pending", None)
+
+        for pid in list(self.persons):
+            if pid not in seen:
+                del self.persons[pid]
+
+        strangers = [p for p, v in result.items() if v[0] == "stranger"]
+        unverified = [p for p, v in result.items() if v[0] == "unverified"]
+        if strangers and self.can_alert("stranger", t):
+            self.event(t, f"BAO DONG: NGUOI LA (khong phai nguoi nha)! ID {strangers}", frame, "stranger")
+            beep()
+        elif unverified and not strangers and self.can_alert("unverified", t):
+            self.event(t, f"CANH BAO: co nguoi chua xac minh duoc mat (ID {unverified})", frame, "unverified")
+            beep()
+        return result
+
+
+# ----------------------------- Vẽ giao diện -----------------------------
+def draw_zone(img, rect, color, label, alpha=0.18):
+    if rect is None:
+        return
+    x1, y1, x2, y2 = [int(v) for v in rect]
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+    put_text(img, label, (x1 + 4, y1 + 20), color, 0.55, 2)
+
+
+def draw_person(img, box, color, label):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+    put_text(img, label, (x1, max(18, y1 - 6)), color, 0.5, 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", default="0", help="đường dẫn video hoặc 0 = webcam")
+    ap.add_argument("--model", default="yolov8n.pt", help="yolov8n.pt (nhẹ) hoặc yolov8s.pt (chính xác hơn)")
+    ap.add_argument("--conf", type=float, default=0.3, help="ngưỡng tin cậy")
+    ap.add_argument("--imgsz", type=int, default=640, help="kích thước ảnh đưa vào YOLO")
+    ap.add_argument("--mode", default="BOTH", choices=MODES)
+    ap.add_argument("--save", default="", help="ví dụ out.mp4 để lưu video kết quả")
+    ap.add_argument("--reselect", action="store_true", help="vẽ lại vùng dù đã có file zones")
+    ap.add_argument("--family", default="family", help="thư mục chứa ảnh người nhà (family/<tên>/*.jpg)")
+    ap.add_argument("--face-thr", type=float, default=0.363,
+                    help="ngưỡng khớp mặt (cosine). Tăng (vd 0.45) nếu nhận nhầm người lạ thành người nhà")
+    ap.add_argument("--no-unverified-alert", action="store_true",
+                    help="không cảnh báo người chưa thấy mặt (chỉ báo khi thấy mặt lạ)")
+    ap.add_argument("--no-gui", action="store_true", help="chạy không hiện cửa sổ (chỉ để --save)")
+    args = ap.parse_args()
+
+    src = int(args.source) if str(args.source).isdigit() else args.source
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        sys.exit(f"Không mở được nguồn video: {args.source}")
+    is_file = not isinstance(src, int)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if fps < 1 or fps > 120:
+        fps = 30.0
+
+    ok, first = cap.read()
+    if not ok:
+        sys.exit("Không đọc được frame đầu tiên.")
+    H, W = first.shape[:2]
+
+    zpath = zones_path(args.source)
+    if args.no_gui:
+        zones = json.load(open(zpath, encoding="utf-8")) if os.path.exists(zpath) else {"bed": None}
+    else:
+        zones = load_or_select_zones(first, zpath, args.reselect)
+    bed = zones.get("bed")
+
+    print("Đang khởi tạo nhận diện mặt ...")
+    faceid = FaceID(args.family, threshold=args.face_thr)
+
+    print(f"Đang tải model {args.model} (lần đầu cần internet) ...")
+    model = YOLO(args.model)
+
+    writer = None
+    if args.save:
+        writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+
+    mon = Monitor(fps, H)
+    mode = args.mode
+    paused = False
+    frame_idx = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) if is_file else None
+    t_start = time.time()
+    frame = first
+    last_status = None
+
+    while True:
+        if not paused:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+            # thời gian: theo video nếu là file, theo đồng hồ nếu là webcam
+            t = frame_idx / fps if is_file else time.time() - t_start
+
+            res = model.track(frame, persist=True, classes=[0], conf=args.conf,
+                              imgsz=args.imgsz, tracker="bytetrack.yaml", verbose=False)[0]
+            people = []
+            if res.boxes is not None and res.boxes.id is not None:
+                ids = res.boxes.id.int().cpu().tolist()
+                boxes = res.boxes.xyxy.cpu().tolist()
+                people = list(zip(ids, boxes))
+
+            vis = frame.copy()
+            if mode in ("BOTH", "BABY"):
+                draw_zone(vis, bed, BLUE, "GIUONG / NOI TRE NAM")
+                if bed is not None:
+                    sx1, sy1, sx2, sy2 = [int(v) for v in shrink(bed, SAFE_MARGIN)]
+                    cv2.rectangle(vis, (sx1, sy1), (sx2, sy2), GREEN, 1)
+
+            child_id = mon.pick_child(people, bed) if mode in ("BOTH", "BABY") else None
+            if mode == "THEFT":
+                mon.child_id = None
+            ident = mon.update_people(people, frame, t, faceid) if mode in ("BOTH", "THEFT") else {}
+            if args.no_unverified_alert:
+                ident = {k: (("pending", None) if v[0] == "unverified" else v) for k, v in ident.items()}
+            strangers = [p for p, v in ident.items() if v[0] == "stranger"]
+            unverified = [p for p, v in ident.items() if v[0] == "unverified"]
+
+            baby_status = None
+            for pid, box in people:
+                if pid == child_id:
+                    baby_status, bcolor = mon.update_baby((pid, box), bed, t, vis)
+                    draw_person(vis, box, bcolor, f"BE #{pid}")
+                else:
+                    kind, name = ident.get(pid, ("pending", None))
+                    if kind == "family":
+                        draw_person(vis, box, GREEN, f"NGUOI NHA: {ascii_name(name)}")
+                    elif kind == "stranger":
+                        draw_person(vis, box, RED, f"NGUOI LA #{pid}")
+                    elif kind == "unverified":
+                        draw_person(vis, box, ORANGE, f"CHUA XAC MINH #{pid}")
+                    else:
+                        draw_person(vis, box, YELLOW, f"Dang xac minh... #{pid}")
+
+            # banner cảnh báo
+            if strangers:
+                cv2.rectangle(vis, (0, 0), (W, 44), (0, 0, 200), -1)
+                put_text(vis, "!!! BAO DONG: PHAT HIEN NGUOI LA !!!", (12, 30), WHITE, 0.8, 2, bg=False)
+            elif unverified:
+                cv2.rectangle(vis, (0, 0), (W, 44), (0, 120, 230), -1)
+                put_text(vis, "CANH BAO: CO NGUOI CHUA XAC MINH DUOC MAT", (12, 30), WHITE, 0.75, 2, bg=False)
+            elif baby_status and baby_status.startswith("NGUY CO"):
+                cv2.rectangle(vis, (0, 0), (W, 44), (0, 0, 200), -1)
+                put_text(vis, "!!! " + baby_status + " !!!", (12, 30), WHITE, 0.8, 2, bg=False)
+
+            # thanh trạng thái phía dưới
+            y = H - 10
+            put_text(vis, f"Che do: {mode}   |   M: doi che do  R: ve lai giuong  SPACE: dung  S: chup  Q: thoat",
+                     (10, y), WHITE, 0.45, 1)
+            if mode in ("BOTH", "BABY"):
+                if child_id is None:
+                    put_text(vis, "Trang thai tre: chua thay tre trong giuong", (10, y - 28), YELLOW, 0.55, 1)
+                elif baby_status:
+                    put_text(vis, f"Trang thai tre: {baby_status}", (10, y - 28), WHITE, 0.55, 1)
+            # nhật ký sự kiện
+            for i, (stamp, text) in enumerate(mon.log):
+                put_text(vis, f"{stamp}  {text}", (10, 70 + i * 24), WHITE, 0.5, 1)
+
+            mon.flush_snapshots(vis)
+            if writer:
+                writer.write(vis)
+            last_status = vis
+
+        if not args.no_gui:
+            cv2.imshow("Demo: Trong tre + Chong trom", last_status if last_status is not None else frame)
+            key = cv2.waitKey(1 if not paused else 30) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            elif key == ord(" "):
+                paused = not paused
+            elif key == ord("m"):
+                mode = MODES[(MODES.index(mode) + 1) % len(MODES)]
+                print("Chế độ:", mode)
+            elif key == ord("s") and last_status is not None:
+                os.makedirs("alerts", exist_ok=True)
+                name = f"alerts/snapshot_{int(time.time())}.jpg"
+                cv2.imwrite(name, last_status)
+                print("Đã lưu", name)
+            elif key == ord("r"):
+                zones = select_zones(frame, zpath)
+                bed = zones.get("bed")
+                mon = Monitor(fps, H)
+
+    cap.release()
+    if writer:
+        writer.release()
+        print("Đã lưu video kết quả:", args.save)
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
